@@ -37,6 +37,7 @@ import 'image_decode_service.dart';
 import 'llama/llama_ffi_engine.dart';
 import 'local_network_permission.dart';
 import 'mlkit_ocr_engine.dart';
+import 'platform_support.dart';
 import 'translation_settings.dart';
 import 'translation_store.dart';
 
@@ -57,13 +58,13 @@ const bool kTranslatorLocalLlmEnabled =
 /// 1GB 权重 + KV cache 极易 OOM，产品决策禁止端侧模型（只能云端 API）；
 /// 该 ABI 的 APK 也不编入 llama.cpp（见 android cpp/CMakeLists.txt）。
 ///
+/// 判定实体在 [isLocalTranslationAdapted]（同时覆盖「非 Android 平台根本
+/// 没有原生库」这一层），这里只保留旧名字给已有调用点。
+///
 /// 注意：dart:ffi 的 [Abi] 在本 SDK 是 class 而非 enum，`Abi.current()`
 /// 是 external factory 构造——不带括号取到的是构造函数本身（tear-off），
 /// 与任何值比较恒 false，曾在所有设备上误报「不支持」。
-bool get kLocalLlmAbiSupported {
-  final abi = Abi.current();
-  return abi == Abi.androidArm64 || abi == Abi.androidX64;
-}
+bool get kLocalLlmAbiSupported => isLocalTranslationAdapted;
 
 /// 端侧引擎不可用时的占位实现（未编译 / 32 位设备），报 [reason]。
 class _UnavailableLocalEngine implements LlmGenerationEngine {
@@ -136,6 +137,15 @@ class TranslationService with TranslationPipeline {
     final s = TranslationSettings(prefs);
     await s.init();
     _settings = s;
+    // 端侧后端没编进当前平台时，把停在「本地」的引擎拉回云端。
+    // 设置页在未适配设备上已经禁用了模型区块，如果不在这里兜底，用户会
+    // 卡在「本地引擎不可用 + 模型设置点不动」的死角里，没有任何出口。
+    if (s.engine == TranslationEngineType.local && !isLocalTranslationAdapted) {
+      LPrinter.d(
+        'translation> 端侧引擎在当前平台不可用，自动回退云端接口',
+      );
+      await s.setEngine(TranslationEngineType.cloud);
+    }
     translationTextScale.value = s.textScale;
     // 提前解析并缓存模型路径：host 的同步 modelPathProvider 依赖它。
     await modelSavePath;
