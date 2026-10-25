@@ -120,3 +120,8 @@ msic
 # FVM Version Cache
 .fvm/
 /lib/src/generated/
+
+.mimosa
+
+# 本地工作记录（智能体会话记忆 / 构建笔记，不入库）
+.workbuddy/
