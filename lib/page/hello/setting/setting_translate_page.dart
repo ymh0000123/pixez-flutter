@@ -27,7 +27,7 @@ library;
 import 'dart:async';
 
 import 'package:bot_toast/bot_toast.dart';
-import 'dart:ffi' show Abi;
+import 'dart:io' show Platform;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter_mobx/flutter_mobx.dart';
@@ -42,6 +42,7 @@ import 'package:pixez/src/generated/i18n/app_localizations.dart';
 import 'package:pixez/translation/cloud_endpoint.dart';
 import 'package:pixez/translation/local_network_permission.dart';
 import 'package:pixez/translation/model_download_service.dart';
+import 'package:pixez/translation/platform_support.dart';
 import 'package:pixez/translation/translation_service.dart';
 import 'package:pixez/translation/translation_settings.dart';
 
@@ -55,12 +56,10 @@ const String _kLocalBackendDisabledWithModelHint =
     '模型已安装；端侧推理后端未编译启用（TRANSLATOR_LOCAL_LLM=1），'
     '本地翻译暂不可用，请改用云端引擎';
 
-/// 32 位模式运行（安装了 armeabi-v7a 包，或设备系统仅 32 位）：
-/// 端侧模型不可用。带上实际 abi 便于排障——64 位设备装错 32 位包是
-/// 最常见原因。
-String _localAbiUnsupportedHint() =>
-    'app 正以 32 位模式运行（${Abi.current()}），不支持端侧模型；'
-    '64 位设备请安装 arm64-v8a / universal 版 APK，或改用云端引擎';
+/// 端侧模型不可用时的原因。文案实体在 translation/platform_support：
+/// 设置页副标题、点击弹窗、内核判定必须说同一件事，否则会出现
+/// 「副标题说 32 位、弹窗说未适配」这种自相矛盾。
+String _localAbiUnsupportedHint() => localTranslationUnsupportedReason();
 
 /// PP-OCRv5 第二 OCR 引擎待接入（规格 D4：留接口）。
 const String _kPaddleNotReadyHint = 'PP-OCRv5 引擎待接入，当前请使用 ML Kit';
@@ -92,6 +91,10 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
   int _total = ModelDownloadState.hyMt2SizeBytes;
   String? _downloadMessage;
 
+  /// 本次会话是否已经提示过「设备未适配」。
+  /// 每进一次设置页都弹会烦；完全不弹又会让用户对着灰掉的模型区块乱猜。
+  static bool _adaptationNoticeShown = false;
+
   @override
   void initState() {
     super.initState();
@@ -100,8 +103,20 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
       setState(() {
         _settings = TranslationService.instance.settings;
       });
+      _maybeShowAdaptationNotice();
     });
     _refreshInstalled();
+  }
+
+  /// 非 Android 客户端（iOS / macOS / Windows / Linux / Web）目前没有端侧
+  /// 推理后端：进页面时说明一次，别让用户以为是自己没下模型。
+  void _maybeShowAdaptationNotice() {
+    if (_adaptationNoticeShown || Platform.isAndroid) return;
+    _adaptationNoticeShown = true;
+    // 等首帧：initState 阶段还没有可用的 Navigator/MaterialLocalizations。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) showDeviceNotAdaptedDialog(context);
+    });
   }
 
   @override
@@ -145,47 +160,71 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
 
   List<Widget> _buildItems(BuildContext context, TranslationSettings s) {
     final i18n = I18n.of(context);
+    // 端侧模型只为 Android 64 位编译（原生库 + 构建链路都在 android/ 下）。
+    // 不可用时整块「模型」设置禁用：放行只会让用户下完 1GB 权重才发现跑不起来。
+    final localUsable = isLocalTranslationAdapted;
     return [
       // ── 引擎 ──
       ListTile(
         leading: const Icon(Icons.swap_horiz),
         title: Text(i18n.translation_engine),
-        trailing: SettingSelectMenu(
-          index: s.engine.index,
-          items: [i18n.translation_engine_local, i18n.translation_engine_cloud],
-          onChange: (index) => s.setEngine(TranslationEngineType.values[index]),
-        ),
+        // 没有本地后端时只剩云端，下拉留着会点出一个空菜单，改成静态文本。
+        trailing: localUsable
+            ? SettingSelectMenu(
+                index: s.engine.index,
+                items: [
+                  i18n.translation_engine_local,
+                  i18n.translation_engine_cloud,
+                ],
+                onChange: (index) =>
+                    s.setEngine(TranslationEngineType.values[index]),
+              )
+            : Text(
+                i18n.translation_engine_cloud,
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
       ),
       ListTile(
         leading: const Icon(Icons.memory),
         title: Text(i18n.translation_engine_local),
         subtitle: Text(_localEngineSubtitle(i18n)),
+        enabled: localUsable,
       ),
-      _buildModelDownloadTile(context, i18n),
+      if (!localUsable) _buildLocalUnavailableBanner(context),
+      _buildModelDownloadTile(context, i18n, enabled: localUsable),
       ListTile(
         leading: const Icon(Icons.upload_file),
         title: Text(i18n.translation_model_import),
-        onTap: _importModel,
+        enabled: localUsable,
+        onTap: localUsable ? _importModel : null,
       ),
       // ── 端侧性能 ──
       ListTile(
         leading: const Icon(Icons.speed),
         title: const Text('推理线程数'),
         subtitle: Text(_threadsSubtitle(s)),
-        trailing: SettingSelectMenu(
-          index: s.llmThreads.clamp(0, 8),
-          items: _kThreadChoices,
-          onChange: (index) => s.setLlmThreads(index),
+        enabled: localUsable,
+        trailing: _disableWhen(
+          !localUsable,
+          SettingSelectMenu(
+            index: s.llmThreads.clamp(0, 8),
+            items: _kThreadChoices,
+            onChange: (index) => s.setLlmThreads(index),
+          ),
         ),
       ),
       ListTile(
         leading: const Icon(Icons.grid_view_rounded),
         title: const Text('批量大小'),
         subtitle: Text(_batchSubtitle(s)),
-        trailing: SettingSelectMenu(
-          index: _kBatchChoices.indexWhere((e) => e == s.llmBatch).clamp(0, 4),
-          items: _kBatchLabels,
-          onChange: (index) => s.setLlmBatch(_kBatchChoices[index]),
+        enabled: localUsable,
+        trailing: _disableWhen(
+          !localUsable,
+          SettingSelectMenu(
+            index: _kBatchChoices.indexWhere((e) => e == s.llmBatch).clamp(0, 4),
+            items: _kBatchLabels,
+            onChange: (index) => s.setLlmBatch(_kBatchChoices[index]),
+          ),
         ),
       ),
       ListTile(
@@ -196,22 +235,27 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
               ? '本机实测批宽 / 线程 / 上下文 / flash-attn，自动选出最快组合'
               : s.llmBenchSummary,
         ),
+        enabled: localUsable,
         trailing: const Icon(Icons.chevron_right, size: 18),
-        onTap: _openBench,
+        onTap: localUsable ? _openBench : null,
       ),
       ListTile(
         leading: const Icon(Icons.dns),
         title: Text(i18n.translation_model_mirror),
-        trailing: SettingSelectMenu(
-          index: s.modelMirror.index,
-          items: [
-            'huggingface.co',
-            'hf-mirror.com',
-            'modelscope.cn',
-            'hf-mirror.net',
-            i18n.translation_model_mirror_custom,
-          ],
-          onChange: (index) => _onMirrorChanged(ModelMirror.values[index]),
+        enabled: localUsable,
+        trailing: _disableWhen(
+          !localUsable,
+          SettingSelectMenu(
+            index: s.modelMirror.index,
+            items: [
+              'huggingface.co',
+              'hf-mirror.com',
+              'modelscope.cn',
+              'hf-mirror.net',
+              i18n.translation_model_mirror_custom,
+            ],
+            onChange: (index) => _onMirrorChanged(ModelMirror.values[index]),
+          ),
         ),
       ),
       SwitchListTile(
@@ -219,7 +263,8 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
         title: Text(i18n.translation_model_direct),
         subtitle: Text(i18n.translation_model_direct_desc),
         value: s.modelDirectDownload,
-        onChanged: (v) => s.setModelDirectDownload(v),
+        // null = 禁用（SwitchListTile 没有 enabled 参数）
+        onChanged: localUsable ? (v) => s.setModelDirectDownload(v) : null,
       ),
       const Divider(),
       // ── 语言 ──
@@ -354,7 +399,55 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
 
   // ── 模型下载管理 ──
 
-  Widget _buildModelDownloadTile(BuildContext context, AppLocalizations i18n) {
+  /// 模型区块顶部的说明条：整块被禁用时必须解释原因，否则用户只会看到
+  /// 一片点不动的灰色控件。
+  Widget _buildLocalUnavailableBanner(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: scheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.info_outline,
+            size: 18,
+            color: scheme.onSecondaryContainer,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              localTranslationUnsupportedReason(),
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.4,
+                color: scheme.onSecondaryContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 只读态：变灰 + 吃掉点击。
+  ///
+  /// `ListTile.enabled` 管不到 trailing（那是独立子树），下拉/按钮仍能点，
+  /// 所以要在外层兜一层 IgnorePointer。
+  Widget _disableWhen(bool disabled, Widget child) {
+    if (!disabled) return child;
+    return IgnorePointer(child: Opacity(opacity: 0.4, child: child));
+  }
+
+  Widget _buildModelDownloadTile(
+    BuildContext context,
+    AppLocalizations i18n, {
+    bool enabled = true,
+  }) {
     final subtitleText = switch (_phase) {
       ModelDownloadPhase.downloading || ModelDownloadPhase.verifying =>
         '${i18n.translation_model_downloading} '
@@ -381,11 +474,19 @@ class _SettingTranslatePageState extends State<SettingTranslatePage> {
         ],
       ),
       // 点击打开模型仓库主页，展示来源与许可（规格 §9.1）
-      onTap: () => launchUrlString(
-        'https://huggingface.co/${ModelSpec.hyMt2.repo}',
-        mode: LaunchMode.externalApplication,
-      ),
-      trailing: _buildModelDownloadTrailing(i18n),
+      enabled: enabled,
+      onTap: enabled
+          ? () => launchUrlString(
+              'https://huggingface.co/${ModelSpec.hyMt2.repo}',
+              mode: LaunchMode.externalApplication,
+            )
+          : null,
+      trailing: enabled
+          ? _buildModelDownloadTrailing(i18n)
+          : _disableWhen(
+              true,
+              _buildModelDownloadTrailing(i18n) ?? const SizedBox.shrink(),
+            ),
     );
   }
 
